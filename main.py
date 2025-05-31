@@ -1,111 +1,210 @@
-from telebot import TeleBot  # + custom_filters?
-import smtplib, ssl
+import os
+import asyncio
+import logging
 from datetime import datetime
-from email.message import EmailMessage
-from email import encoders
-from email.mime.base import MIMEBase
+from pathlib import Path
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Filter
+from aiogram.types import Message
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formatdate
-import credits
+from email.mime.base import MIMEBase
+from email import encoders
+import aiosmtplib
+from typing import TypedDict
 
-# Telegram bot token
-TOKEN = credits.TOKEN
+# Настройка логгирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-# Email SMTP configurations
-SMTP_SERVER = credits.SMTP_SERVER
-SMTP_PORT = credits.SMTP_PORT
-EMAIL_USER = credits.EMAIL_USER
-EMAIL_PASSWORD = credits.EMAIL_PASSWORD
-EMAIL_RECEIVER = credits.EMAIL_RECEIVER
-USERS = credits.USERS
+# Загрузка переменных окружения
+load_dotenv()
 
-bot = TeleBot(TOKEN)
-current_date_string = datetime.now().strftime('%m/%d/%y %H:%M:%S')
+class SenderInfo(TypedDict):
+    name: str
+    username: str
 
+class SecurityFilter(Filter):
+    """Фильтр для проверки безопасности"""
+    def __init__(self, allowed_users: list[int]):
+        self.allowed_users = allowed_users
 
-@bot.message_handler(func=lambda message: True, content_types=['text'])  # Отправка простого текстового сообщения
-def handle_message(message):
-    chat_id = message.chat.id
-    text = message.text
+    async def __call__(self, message: Message) -> bool:
+        if message.from_user.id not in self.allowed_users:
+            logger.warning(f"Unauthorized access attempt from {message.from_user.id}")
+            return False
+        return True
 
-    # Sending the message to the email
-    email_message = EmailMessage()
-    email_message['Subject'] = f'Сообщение из Telegram от {current_date_string}'
-    email_message['From'] = f'"{message.from_user.first_name} {message.from_user.last_name}" <{EMAIL_USER}>'
-    email_message['To'] = EMAIL_RECEIVER
-    email_message['Date'] = datetime.now().strftime('%m/%d/%y')
-    email_message.set_content(f'Прислано из из Telegram:\n{text}')
+# Конфигурация
+CONFIG = {
+    "TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
+    "SMTP": {
+        "SERVER": os.getenv("SMTP_SERVER"),
+        "PORT": int(os.getenv("SMTP_PORT", 465)),
+        "USER": os.getenv("EMAIL_USER"),
+        "PASSWORD": os.getenv("EMAIL_PASSWORD"),
+        "RECEIVER": os.getenv("EMAIL_RECEIVER")
+    },
+    "ALLOWED_USERS": [
+        int(uid) for uid in os.getenv("ALLOWED_USERS", "").split(",") if uid.strip().isdigit()
+    ],
+    "RATE_LIMIT": {
+        "MESSAGES": 3,
+        "INTERVAL": 60
+    }
+}
+
+# Инициализация бота
+bot = Bot(token=CONFIG["TOKEN"])
+dp = Dispatcher()
+
+# Инициализация фильтров
+security_filter = SecurityFilter(CONFIG["ALLOWED_USERS"])
+
+def create_email_template(sender: SenderInfo, content: str, is_file: bool = False) -> MIMEMultipart:
+    """Создает HTML-шаблон письма"""
+    message = MIMEMultipart()
+    message["From"] = f'Telegram Bot <{CONFIG["SMTP"]["USER"]}>'
+    message["To"] = CONFIG["SMTP"]["RECEIVER"]
+    message["Date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    html = f"""
+    <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
+                .header {{ color: #2c3e50; border-bottom: 1px solid #eee; }}
+                .content {{ background: #f9f9f9; padding: 15px; border-radius: 5px; }}
+                .footer {{ color: #7f8c8d; font-size: 0.9em; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h2>📨 Новое сообщение из Telegram</h2>
+                <p><strong>От:</strong> {sender['name']} (@{sender['username']})</p>
+                <p><strong>Время:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            </div>
+            <div class="content">
+                {f'<p>📎 Прикрепленный файл: <strong>{content}</strong></p>' if is_file else content}
+            </div>
+            <div class="footer">
+                <p>Это сообщение было отправлено автоматически.</p>
+            </div>
+        </body>
+    </html>
+    """
+
+    message.attach(MIMEText(html, "html"))
+    return message
+
+async def send_email(subject: str, message: MIMEMultipart, attachment_path: str = None):
+    """Асинхронная отправка email с возможным вложением"""
+    message["Subject"] = subject
+
+    if attachment_path:
+        with open(attachment_path, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename={Path(attachment_path).name}"
+            )
+            message.attach(part)
 
     try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as smtp_server:
-            smtp_server.login(EMAIL_USER, EMAIL_PASSWORD)
-            smtp_server.send_message(email_message)
-            smtp_server.quit()
-            bot.send_message(chat_id, 'Ок!')
+        async with aiosmtplib.SMTP(
+            hostname=CONFIG["SMTP"]["SERVER"],
+            port=CONFIG["SMTP"]["PORT"],
+            use_tls=True
+        ) as smtp:
+            await smtp.login(CONFIG["SMTP"]["USER"], CONFIG["SMTP"]["PASSWORD"])
+            await smtp.send_message(message)
+        logger.info(f"Email sent: {subject}")
     except Exception as e:
-        bot.send_message(chat_id, f'Error: {str(e)}')
+        logger.error(f"Email sending failed: {e}")
+        raise
 
-
-@bot.message_handler(content_types=['photo', 'document'])  # Отправка изображения или документа
-def handle_message(message):
-    global src
-    chat_id = message.chat.id
-
-    # Sending the message to the email
-    email_message = MIMEMultipart()
-    email_message['From'] = f'"{message.from_user.first_name} {message.from_user.last_name}" <{EMAIL_USER}>'
-    email_message['To'] = EMAIL_RECEIVER
-    email_message['Date'] = formatdate(localtime=True)
-
-    from pathlib import Path
-    Path(f'files/{message.chat.id}/').mkdir(parents=True, exist_ok=True)
-    if message.content_type == 'photo':
-        email_message['Subject'] = f'Изображение из Telegram от {current_date_string}'
-        file_info = bot.get_file(message.photo[len(message.photo) - 1].file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        src = file_info.file_path.replace('photos/', '')
-        body = f'{message.content_type.upper()} отправлено из Telegram:\n  {src}'
-        email_message.attach(MIMEText(body, "plain"))
-        with open(src, 'wb') as bc:
-            bc.write(downloaded_file)
-        with open(src, 'rb') as bc:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(bc.read())
-
-    if message.content_type == 'document':
-        email_message['Subject'] = f'Документ из Telegram от {current_date_string}'
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        src = message.document.file_name
-        body = f'{message.content_type.upper()} отправлено из Telegram:\n  {src}'
-        email_message.attach(MIMEText(body, "plain"))
-        with open(src, 'wb') as bc:
-            bc.write(downloaded_file)
-        with open(src, 'rb') as bc:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(bc.read())
-
-    encoders.encode_base64(part)
-    part.add_header(
-        "Content-Disposition",
-        f"attachment; filename={src}",
-    )
-    email_message.attach(part)
-    email_messages = email_message.as_string()
+@dp.message(security_filter, F.content_type == "text")
+async def handle_text(message: types.Message):
+    """Обработчик текстовых сообщений"""
+    sender = {
+        "name": message.from_user.full_name,
+        "username": message.from_user.username
+    }
 
     try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as smtp_server:
-            smtp_server.login(EMAIL_USER, EMAIL_PASSWORD)
-            smtp_server.sendmail(EMAIL_USER, EMAIL_RECEIVER, email_messages)
-            bot.send_message(chat_id, 'Ок!')
+        email = create_email_template(sender, message.text)
+        await send_email(
+            subject=f"✉️ Сообщение от {sender['name']}",
+            message=email
+        )
+        await message.reply("✅ Сообщение успешно отправлено на email!")
     except Exception as e:
-        bot.send_message(chat_id, f'Error: {str(e)}')
+        logger.error(f"Text handling error: {e}")
+        await message.reply("❌ Произошла ошибка при отправке сообщения")
+
+@dp.message(security_filter, F.content_type.in_(["photo", "document"]))
+async def handle_files(message: types.Message):
+    """Обработчик файлов"""
+    sender = {
+        "name": message.from_user.full_name,
+        "username": message.from_user.username
+    }
+
+    file_path = None
+    try:
+        if message.content_type == "photo":
+            file = message.photo[-1]
+            ext = ".jpg"
+        else:
+            file = message.document
+            ext = Path(file.file_name or "file.bin").suffix
+
+        file_path = Path(f"temp/{file.file_id}{ext}")
+        file_path.parent.mkdir(exist_ok=True)
+
+        await bot.download(file, destination=file_path)
+
+        email = create_email_template(
+            sender,
+            file_path.name,
+            is_file=True
+        )
+
+        await send_email(
+            subject=f"📎 Файл от {sender['name']}",
+            message=email,
+            attachment_path=str(file_path)
+        )
+
+        await message.reply("✅ Файл успешно отправлен на email!")
+    except Exception as e:
+        logger.error(f"File handling error: {e}")
+        await message.reply("❌ Произошла ошибка при отправке файла")
     finally:
-        file = Path(src)
-        file.unlink()
+        try:
+            if file_path and file_path.exists():
+                file_path.unlink()
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to remove file: {cleanup_error}")
 
+@dp.message()
+async def handle_unauthorized(message: types.Message):
+    """Обработчик неавторизованных запросов"""
+    await message.reply(
+        "⛔ Доступ запрещен\n\n"
+        f"Ваш ID: {message.from_user.id}\n"
+        "Обратитесь к администратору для получения доступа"
+    )
 
-bot.infinity_polling(none_stop=True, interval=3)
+async def main():
+    logger.info("Starting bot...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
